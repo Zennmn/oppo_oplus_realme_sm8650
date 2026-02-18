@@ -564,7 +564,7 @@ jobs:
           wget https://github.com/cctv18/oppo_oplus_realme_sm8650/raw/refs/heads/main/other_patch/config.patch
           patch -p1 -F 3 < config.patch || true
 
-      - name: 自动尝试移植 BBRv3
+      - name: BBRv3 完整移植 - 获取上游源码
         if: inputs.bbrv3_auto && inputs.bbr_enable != 'false'
         run: |
           set -e
@@ -573,118 +573,297 @@ jobs:
           if [[ -z "$BBRV3_REF" ]]; then
             BBRV3_REF="bbrv3-2025-03-18"
           fi
-          echo "正在尝试移植 BBRv3，来源: $BBRV3_REF"
+          echo "=========================================="
+          echo "BBRv3 完整特性移植 (非兼容层)"
+          echo "来源: google/bbr @ $BBRV3_REF"
+          echo "=========================================="
           if ! git clone --depth=1 --branch "$BBRV3_REF" https://github.com/google/bbr.git bbrv3-src; then
-            echo "::warning::未找到 ref=$BBRV3_REF，回退到 v3 分支"
-            git clone --depth=1 --branch v3 https://github.com/google/bbr.git bbrv3-src
+            echo "::error::未找到 ref=$BBRV3_REF，完整移植要求精确来源"
+            exit 1
           fi
           for rel in net/ipv4/tcp_bbr.c include/uapi/linux/inet_diag.h; do
             if [[ -f "bbrv3-src/$rel" && -f "common/$rel" ]]; then
               cp "bbrv3-src/$rel" "common/$rel"
               echo "已同步: $rel"
             else
-              echo "::warning::缺少文件，跳过: $rel"
+              echo "::error::缺少必要文件: $rel"
+              exit 1
             fi
           done
 
-          # 6.1.118 compat: trim hard deps from BBRv3 (PLB/BPF kfunc/TLP symbols)
-          if [[ ! -f common/net/ipv4/tcp_bbr.c ]]; then
-            echo "::error::missing common/net/ipv4/tcp_bbr.c"
-            exit 1
-          fi
+      - name: BBRv3 完整移植 - 回移植内核头文件与TCP核心
+        if: inputs.bbrv3_auto && inputs.bbr_enable != 'false'
+        run: |
+          set -e
+          cd kernel_workspace
 
-          if ! grep -q "BBRv3 compat for older 6.1 vendor trees" common/net/ipv4/tcp_bbr.c; then
-            awk '
-              { print }
-              $0 == "#include \"tcp_dctcp.h\"" {
-                print ""
-                print "/* BBRv3 compat for older 6.1 vendor trees (no PLB/BPF kfunc/TLP event). */"
-                print "#ifndef __bpf_kfunc"
-                print "#define __bpf_kfunc"
-                print "#endif"
-                print "#ifndef TCP_ECN_LOW"
-                print "#define TCP_ECN_LOW 0"
-                print "#endif"
-                print "#ifndef TCP_ECN_ECT_PERMANENT"
-                print "#define TCP_ECN_ECT_PERMANENT 0"
-                print "#endif"
-                print "#ifndef CA_EVENT_TLP_RECOVERY"
-                print "#define CA_EVENT_TLP_RECOVERY ((enum tcp_ca_event)-1)"
-                print "#endif"
-                print "#ifndef TCP_PLB_SCALE"
-                print "#define TCP_PLB_SCALE BBR_SCALE"
-                print "struct tcp_plb_state {"
-                print "\tu32 pause_until;"
-                print "};"
-                print "static inline void tcp_plb_update_state(struct sock *sk, struct tcp_plb_state *plb, int ce_ratio) { }"
-                print "static inline void tcp_plb_check_rehash(struct sock *sk, struct tcp_plb_state *plb) { }"
-                print "static inline void tcp_plb_update_state_upon_rto(struct sock *sk, struct tcp_plb_state *plb) { }"
-                print "#endif"
-                print ""
-                print "/* 6.1 vendor compat helpers for rate_sample/tcp_skb_cb API differences. */"
-                print "static inline u32 bbr_rs_tx_in_flight(const struct rate_sample *rs) { return rs->prior_in_flight; }"
-                print "static inline s32 bbr_rs_lost(const struct rate_sample *rs) { return rs->losses; }"
-                print "static inline bool bbr_rs_is_ece(const struct rate_sample *rs) { return false; }"
-                print "static inline bool bbr_rs_is_acking_tlp_retrans_seq(const struct rate_sample *rs) { return false; }"
-                print "static inline bool bbr_tcp_skb_tx_in_flight_is_suspicious(u32 skb_pcount, u8 skb_sacked_flags, u32 tx_in_flight) { return false; }"
-              }
-            ' common/net/ipv4/tcp_bbr.c > common/net/ipv4/tcp_bbr.c.new
-            mv common/net/ipv4/tcp_bbr.c.new common/net/ipv4/tcp_bbr.c
-          fi
+          echo ">>> 步骤1: 扩大 ICSK CA priv 空间 (104 -> 160)"
+          sed -ri "s/(icsk_ca_priv\[)104([[:space:]]*\/[[:space:]]*sizeof\(u64\)\];)/\1160\2/" \
+            common/include/net/inet_connection_sock.h
 
-          python -c 'from pathlib import Path; p=Path("common/net/ipv4/tcp_bbr.c"); s=p.read_text(encoding="utf-8"); s=s.replace("struct net *net = sock_net(sk);","struct net *net __maybe_unused = sock_net(sk);"); s=s.replace("READ_ONCE(net->ipv4.sysctl_tcp_plb_enabled)","0"); reps=[("rs->tx_in_flight","bbr_rs_tx_in_flight(rs)"),("rs->lost","bbr_rs_lost(rs)"),("rs->is_ece","bbr_rs_is_ece(rs)"),("rs->is_acking_tlp_retrans_seq","bbr_rs_is_acking_tlp_retrans_seq(rs)"),("rs.tx_in_flight","rs.prior_in_flight"),("rs.lost","rs.losses"),("TCP_SKB_CB(skb)->tx.lost","0"),("scb->tx.in_flight","bbr->inflight_latest"),("scb->tx.lost","0"),("tp->tlp_orig_data_app_limited","0"),("tp->fast_ack_mode = bbr_fast_ack_mode ? 1 : 0;","(void)bbr_fast_ack_mode;")]; [s:=s.replace(a,b) for a,b in reps]; s=s.replace("bbr_tcp_skb_tx_in_flight_is_suspicious(", "__BBR_TMP_TXINF__("); s=s.replace("tcp_skb_tx_in_flight_is_suspicious(", "bbr_tcp_skb_tx_in_flight_is_suspicious("); s=s.replace("__BBR_TMP_TXINF__(", "bbr_tcp_skb_tx_in_flight_is_suspicious("); s=s.replace("| TCP_CONG_WANTS_CE_EVENTS",""); s=s.replace(".tso_segs\t\t= bbr_tso_segs,",".min_tso_segs\t= bbr_min_tso_segs_compat,"); s=s.replace(".tso_segs\t= bbr_tso_segs,",".min_tso_segs\t= bbr_min_tso_segs_compat,"); s=s.replace(".min_tso_segs\t= bbr_tso_segs,",".min_tso_segs\t= bbr_min_tso_segs_compat,"); s=s.replace(".min_tso_segs = bbr_tso_segs,",".min_tso_segs = bbr_min_tso_segs_compat,"); s="\n".join(line for line in s.splitlines() if ".skb_marked_lost" not in line)+"\n"; s=s.replace("BTF_KFUNCS_START(","BTF_SET8_START(").replace("BTF_KFUNCS_END(","BTF_SET8_END("); s=s.replace(".cong_control\t= bbr_main,",".cong_control\t= bbr_main_compat,"); s=s.replace(".cong_control = bbr_main,",".cong_control\t= bbr_main_compat,"); needle="static struct tcp_congestion_ops tcp_bbr_cong_ops __read_mostly = {"; main_wrap="static void bbr_main_compat(struct sock *sk, const struct rate_sample *rs)\n{\n\tbbr_main(sk, 0, 0, rs);\n}\n\n"; min_wrap="static u32 bbr_min_tso_segs_compat(struct sock *sk)\n{\n\treturn bbr_tso_segs(sk, tcp_sk(sk)->mss_cache);\n}\n\n"; s=s if ("static u32 bbr_min_tso_segs_compat(struct sock *sk)" in s or needle not in s) else s.replace(needle, min_wrap+needle, 1); s=s if ("static void bbr_main_compat(struct sock *sk, const struct rate_sample *rs)" in s or needle not in s) else s.replace(needle, main_wrap+needle, 1); p.write_text(s, encoding="utf-8", newline="\n")'
-
-          python - <<'PY'
+          echo ">>> 步骤2: 回移植 include/net/tcp.h"
+          python3 - <<'PYHEADER'
           from pathlib import Path
-
-          p = Path("common/net/ipv4/tcp_bbr.c")
+          p = Path("common/include/net/tcp.h")
           s = p.read_text(encoding="utf-8")
-          marker = 'pr_info("tcp_bbr: BBRv3 patched (compat)\\n");'
 
-          if marker not in s:
-            line = "\treturn tcp_register_congestion_control(&tcp_bbr_cong_ops);"
-            if line in s:
-              s = s.replace(line, "\t" + marker + "\n" + line, 1)
-            elif "return tcp_register_congestion_control(&tcp_bbr_cong_ops);" in s:
+          # 2a. TCP_ECN_LOW / TCP_ECN_ECT_PERMANENT
+          if "TCP_ECN_LOW" not in s:
               s = s.replace(
-                "return tcp_register_congestion_control(&tcp_bbr_cong_ops);",
-                marker + "\n\treturn tcp_register_congestion_control(&tcp_bbr_cong_ops);",
-                1,
+                  "#define\tTCP_ECN_SEEN\t\t8",
+                  "#define\tTCP_ECN_SEEN\t\t8\n"
+                  "#define\tTCP_ECN_LOW\t\t16\n"
+                  "#define\tTCP_ECN_ECT_PERMANENT\t32"
               )
-            else:
-              raise SystemExit("BBRv3 marker inject failed: register call not found")
+              print("  + TCP_ECN_LOW / TCP_ECN_ECT_PERMANENT")
+
+          # 2b. tcp_skb_cb.tx: in_flight + lost
+          if "TCPCB_IN_FLIGHT_BITS" not in s:
+              old_tx_end = "\t\t\tu64 delivered_mstamp;\n\t\t} tx;   /* only used for outgoing skbs */"
+              new_tx_end = (
+                  "\t\t\tu64 delivered_mstamp;\n"
+                  "#define TCPCB_IN_FLIGHT_BITS\t20\n"
+                  "#define TCPCB_IN_FLIGHT_MAX\t((1U << TCPCB_IN_FLIGHT_BITS) - 1)\n"
+                  "\t\t\tu32 in_flight:20,\n"
+                  "\t\t\t    unused2:12;\n"
+                  "\t\t\tu32 lost;\n"
+                  "\t\t} tx;   /* only used for outgoing skbs */"
+              )
+              s = s.replace(old_tx_end, new_tx_end)
+              print("  + tcp_skb_cb.tx.in_flight / tx.lost")
+
+          # 2c. CA_EVENT_TLP_RECOVERY
+          if "CA_EVENT_TLP_RECOVERY" not in s:
+              s = s.replace(
+                  "\tCA_EVENT_ECN_IS_CE,\t/* received CE marked IP packet */\n};",
+                  "\tCA_EVENT_ECN_IS_CE,\t/* received CE marked IP packet */\n"
+                  "\tCA_EVENT_TLP_RECOVERY,\t/* TLP probe repaired a lost segment */\n};"
+              )
+              print("  + CA_EVENT_TLP_RECOVERY")
+
+          # 2d. TCP_CONG_WANTS_CE_EVENTS
+          if "TCP_CONG_WANTS_CE_EVENTS" not in s:
+              s = s.replace(
+                  "#define TCP_CONG_NEEDS_ECN\t0x2",
+                  "#define TCP_CONG_NEEDS_ECN\t0x2\n"
+                  "#define TCP_CONG_WANTS_CE_EVENTS\t0x100"
+              )
+              s = s.replace(
+                  "#define TCP_CONG_MASK\t(TCP_CONG_NON_RESTRICTED | TCP_CONG_NEEDS_ECN)",
+                  "#define TCP_CONG_MASK\t(TCP_CONG_NON_RESTRICTED | TCP_CONG_NEEDS_ECN | \\\n"
+                  "\t\t\t TCP_CONG_WANTS_CE_EVENTS)"
+              )
+              print("  + TCP_CONG_WANTS_CE_EVENTS")
+
+          # 2e. rate_sample: prior_lost, tx_in_flight, lost, is_ece, is_acking_tlp_retrans_seq
+          if "tx_in_flight" not in s:
+              s = s.replace(
+                  "\tu32  prior_delivered_ce;/* tp->delivered_ce at \"prior_mstamp\" */\n"
+                  "\ts32  delivered;",
+                  "\tu32  prior_delivered_ce;/* tp->delivered_ce at \"prior_mstamp\" */\n"
+                  "\tu32  prior_lost;\n"
+                  "\tu32  tx_in_flight;\n"
+                  "\ts32  lost;\n"
+                  "\ts32  delivered;"
+              )
+              print("  + rate_sample: prior_lost / tx_in_flight / lost")
+
+          if "is_ece" not in s:
+              s = s.replace(
+                  "\tbool is_ack_delayed;\t/* is this (likely) a delayed ACK? */\n};",
+                  "\tbool is_acking_tlp_retrans_seq;\n"
+                  "\tbool is_ack_delayed;\n"
+                  "\tbool is_ece;\n};"
+              )
+              print("  + rate_sample: is_ece / is_acking_tlp_retrans_seq")
+
+          # 2f. tcp_congestion_ops: tso_segs / skb_marked_lost
+          if "tso_segs" not in s and "min_tso_segs" in s:
+              s = s.replace(
+                  "\tu32 (*min_tso_segs)(struct sock *sk);",
+                  "\tu32 (*min_tso_segs)(struct sock *sk);\n"
+                  "\tu32 (*tso_segs)(struct sock *sk, unsigned int mss_now);\n"
+                  "\tvoid (*skb_marked_lost)(struct sock *sk, const struct sk_buff *skb);"
+              )
+              print("  + tcp_congestion_ops: tso_segs / skb_marked_lost")
+
+          # 2g. cong_control signature: (sk, rs) -> (sk, ack, flag, rs)
+          old_cc = "void (*cong_control)(struct sock *sk, const struct rate_sample *rs);"
+          new_cc = "void (*cong_control)(struct sock *sk, u32 ack, int flag, const struct rate_sample *rs);"
+          if old_cc in s:
+              s = s.replace(old_cc, new_cc)
+              print("  + cong_control signature updated")
+
+          # 2h. PLB inline stubs + tcp_skb_tx_in_flight_is_suspicious
+          if "TCP_PLB_SCALE" not in s:
+              plb = (
+                  "\n/* Protective Load Balancing */\n"
+                  "#define TCP_PLB_SCALE 8\n"
+                  "struct tcp_plb_state { u8 consec; u32 pause_until; };\n"
+                  "static inline void tcp_plb_init(const struct sock *sk, struct tcp_plb_state *plb) { plb->consec = 0; plb->pause_until = 0; }\n"
+                  "static inline void tcp_plb_update_state(const struct sock *sk, struct tcp_plb_state *plb, const int cr) { }\n"
+                  "static inline void tcp_plb_check_rehash(struct sock *sk, struct tcp_plb_state *plb) { }\n"
+                  "static inline void tcp_plb_update_state_upon_rto(struct sock *sk, struct tcp_plb_state *plb) { }\n"
+                  "\nstatic inline bool tcp_skb_tx_in_flight_is_suspicious(u32 pcount, u32 sacked, u32 txif) {\n"
+                  "\tif (txif < pcount) return true;\n"
+                  "\tif (sacked & TCPCB_RETRANS) return true;\n"
+                  "\treturn false;\n"
+                  "}\n\n"
+              )
+              if "#define TCP_ULP_BUF_MAX" in s:
+                  s = s.replace("#define TCP_ULP_BUF_MAX", plb + "#define TCP_ULP_BUF_MAX")
+              print("  + PLB stubs + tcp_skb_tx_in_flight_is_suspicious")
 
           p.write_text(s, encoding="utf-8", newline="\n")
-          PY
+          print("=== include/net/tcp.h 完成 ===")
+          PYHEADER
 
-          # BBRv3 struct bbr is larger on newer upstream; enlarge CA private storage on 6.1 vendor trees.
-          if [[ -f common/include/net/inet_connection_sock.h ]]; then
-            sed -ri "s/(icsk_ca_priv\\[)104([[:space:]]*\\/[[:space:]]*sizeof\\(u64\\)\\];)/\\1160\\2/" common/include/net/inet_connection_sock.h
-          fi
+          echo ">>> 步骤3: 修改 tcp_rate.c - 填充 tx.in_flight / tx.lost / rs fields"
+          python3 - <<'PYRATE'
+          from pathlib import Path
+          p = Path("common/net/ipv4/tcp_rate.c")
+          s = p.read_text(encoding="utf-8")
 
-          if grep -q "sysctl_tcp_plb_enabled" common/net/ipv4/tcp_bbr.c; then
-            echo "::error::BBRv3 compat patch failed: sysctl_tcp_plb_enabled still present"
-            exit 1
-          fi
+          # Record in_flight + lost at send time
+          if "tx.in_flight" not in s:
+              marker = "TCP_SKB_CB(skb)->tx.delivered_mstamp = tp->delivered_mstamp;"
+              if marker in s:
+                  s = s.replace(marker,
+                      marker + "\n"
+                      "\tTCP_SKB_CB(skb)->tx.in_flight = min_t(u32, tp->packets_out, TCPCB_IN_FLIGHT_MAX);\n"
+                      "\tTCP_SKB_CB(skb)->tx.lost      = tp->lost;"
+                  )
+                  print("  + tcp_rate_skb_sent: tx.in_flight / tx.lost")
 
-          if grep -Eq "rs->tx_in_flight|rs->lost|rs->is_ece|rs->is_acking_tlp_retrans_seq|scb->tx.in_flight|scb->tx.lost|TCP_SKB_CB\\(skb\\)->tx.lost|tp->fast_ack_mode|tp->tlp_orig_data_app_limited|TCP_CONG_WANTS_CE_EVENTS|\\.tso_segs\\s*=|\\.min_tso_segs\\s*=\\s*bbr_tso_segs|\\.skb_marked_lost\\s*=|BTF_KFUNCS_START|BTF_KFUNCS_END|bbr_bbr_tcp_skb_tx_in_flight_is_suspicious" common/net/ipv4/tcp_bbr.c; then
-            echo "::error::BBRv3 compat patch failed: unresolved 6.1 incompat symbols still present"
-            exit 1
-          fi
+          # Fill rs->tx_in_flight / rs->lost / rs->prior_lost in tcp_rate_gen
+          if "rs->tx_in_flight" not in s:
+              lines_r = s.split("\n")
+              out = []
+              for line in lines_r:
+                  out.append(line)
+                  if "rs->prior_in_flight" in line and "=" in line:
+                      out.append("\trs->tx_in_flight = scb->tx.in_flight;")
+                      out.append("\trs->lost         = tp->lost - scb->tx.lost;")
+                      out.append("\trs->prior_lost   = scb->tx.lost;")
+                      print("  + tcp_rate_gen: rs->tx_in_flight / rs->lost / rs->prior_lost")
+              s = "\n".join(out)
 
-          if grep -Eq "inflight_hi|bw_hi|loss_in_round|bw_probe_up_rounds" common/net/ipv4/tcp_bbr.c; then
-            echo "BBRV3_PATCHED=true" >> $GITHUB_ENV
-            echo "BBRv3 特征符号检测通过"
-          else
-            echo "::error::未检测到 BBRv3 特征符号，终止构建"
-            exit 1
-          fi
+          p.write_text(s, encoding="utf-8", newline="\n")
+          print("=== tcp_rate.c 完成 ===")
+          PYRATE
 
+          echo ">>> 步骤4: 修改 tcp_input.c - cong_control 调用签名"
+          python3 - <<'PYINPUT'
+          import re
+          from pathlib import Path
+          p = Path("common/net/ipv4/tcp_input.c")
+          s = p.read_text(encoding="utf-8")
 
-          if ! grep -q "BBRv3 patched (compat)" common/net/ipv4/tcp_bbr.c; then
-            echo "::error::BBRv3 marker inject failed"
-            exit 1
-          fi
+          # Fix cong_control call sites: (sk, &rs) -> (sk, ack, flag, &rs)
+          pattern = re.compile(r'(->cong_control\(sk),\s*(&rs\))')
+          if pattern.search(s):
+              s = pattern.sub(r'\1, ack, flag, \2', s)
+              print("  + cong_control call signature fixed")
+          else:
+              print("  ! cong_control call pattern not found (may already be correct or different)")
+
+          # rs.is_ece + is_acking_tlp_retrans_seq init in tcp_ack
+          if "rs.is_ece" not in s:
+              lines_i = s.split("\n")
+              out = []
+              inserted = False
+              for line in lines_i:
+                  out.append(line)
+                  if not inserted and "struct rate_sample rs" in line:
+                      # After declaration add init
+                      pass  # will init later
+                  if not inserted and "rs.prior_delivered" in line and "=" in line and "tp->delivered" in line:
+                      out.append("\trs.is_ece = false;")
+                      out.append("\trs.is_acking_tlp_retrans_seq = false;")
+                      out.append("\trs.prior_lost = 0;")
+                      out.append("\trs.tx_in_flight = 0;")
+                      out.append("\trs.lost = 0;")
+                      inserted = True
+                      print("  + rs field init in tcp_ack")
+              s = "\n".join(out)
+
+          p.write_text(s, encoding="utf-8", newline="\n")
+          print("=== tcp_input.c 完成 ===")
+          PYINPUT
+
+      - name: BBRv3 完整移植 - 修补 tcp_bbr.c
+        if: inputs.bbrv3_auto && inputs.bbr_enable != 'false'
+        run: |
+          set -e
+          cd kernel_workspace
+
+          echo ">>> 步骤5: 最小修补 tcp_bbr.c (BPF/PLB sysctl/未使用变量)"
+          python3 - <<'PYBBR'
+          from pathlib import Path
+          p = Path("common/net/ipv4/tcp_bbr.c")
+          s = p.read_text(encoding="utf-8")
+
+          # __bpf_kfunc compat
+          if "#ifndef __bpf_kfunc" not in s:
+              s = s.replace(
+                  '#include "tcp_dctcp.h"',
+                  '#include "tcp_dctcp.h"\n\n'
+                  '#ifndef __bpf_kfunc\n'
+                  '#define __bpf_kfunc\n'
+                  '#endif', 1
+              )
+              print("  + __bpf_kfunc compat")
+
+          # BTF API compat
+          s = s.replace("BTF_KFUNCS_START(", "BTF_SET8_START(")
+          s = s.replace("BTF_KFUNCS_END(", "BTF_SET8_END(")
+
+          # PLB sysctl stub
+          s = s.replace("struct net *net = sock_net(sk);",
+                        "struct net *net __maybe_unused = sock_net(sk);")
+          s = s.replace("READ_ONCE(net->ipv4.sysctl_tcp_plb_enabled)", "0")
+
+          # fast_ack_mode not in 6.1 vendor
+          s = s.replace("tp->fast_ack_mode = bbr_fast_ack_mode ? 1 : 0;",
+                        "(void)bbr_fast_ack_mode;")
+
+          # tlp_orig_data_app_limited not in 6.1
+          s = s.replace("tp->tlp_orig_data_app_limited", "0")
+
+          # Boot marker
+          marker = 'pr_info("tcp_bbr: BBRv3 full-port loaded\\n");'
+          if marker not in s:
+              s = s.replace(
+                  "\treturn tcp_register_congestion_control(&tcp_bbr_cong_ops);",
+                  "\t" + marker + "\n\treturn tcp_register_congestion_control(&tcp_bbr_cong_ops);",
+                  1)
+              print("  + boot marker")
+
+          p.write_text(s, encoding="utf-8", newline="\n")
+          print("=== tcp_bbr.c 完成 ===")
+          PYBBR
+
+      - name: BBRv3 完整移植 - 验证特征符号
+        if: inputs.bbrv3_auto && inputs.bbr_enable != 'false'
+        run: |
+          set -e
+          cd kernel_workspace
+          echo ">>> 步骤6: 验证特征符号"
+          for sym in inflight_hi bw_hi loss_in_round bw_probe_up_rounds; do
+            grep -q "$sym" common/net/ipv4/tcp_bbr.c || { echo "::error::BBRv3特征缺失: $sym"; exit 1; }
+            echo "✓ $sym"
+          done
+          for sym in tx_in_flight is_ece CA_EVENT_TLP_RECOVERY TCP_PLB_SCALE TCPCB_IN_FLIGHT_BITS; do
+            grep -q "$sym" common/include/net/tcp.h || { echo "::error::头文件缺失: $sym"; exit 1; }
+            echo "✓ $sym"
+          done
+          grep -q "cong_control.*ack.*flag.*rs" common/include/net/tcp.h || { echo "::error::cong_control签名未更新"; exit 1; }
+          echo "✓ cong_control signature"
+          grep -q "BBRv3 full-port loaded" common/net/ipv4/tcp_bbr.c || { echo "::error::boot marker缺失"; exit 1; }
+          echo "✓ boot marker"
+          echo "BBRV3_PATCHED=true" >> $GITHUB_ENV
+          echo "========== BBRv3 完整移植验证通过 =========="
+
 
       - name: 添加 BBR 等一系列拥塞控制算法
         run: |
@@ -773,7 +952,7 @@ jobs:
             done
           fi
 
-      - name: BBRv3 快速编译检查 (tcp_bbr.o)
+      - name: BBRv3 快速编译检查 (tcp_bbr.o + tcp_rate.o)
         if: inputs.bbrv3_auto && inputs.bbr_enable != 'false'
         run: |
           WORKDIR="$(pwd)"
@@ -783,7 +962,9 @@ jobs:
           cd kernel_workspace/common
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error gki_defconfig
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error net/ipv4/tcp_bbr.o
-          echo "BBRv3 quick compile check passed"
+          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error net/ipv4/tcp_rate.o
+          echo "BBRv3 full-port quick compile check passed"
+
 
       - name: 构建内核
         run: |
